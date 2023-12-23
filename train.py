@@ -1,7 +1,7 @@
 import random
 
+import matplotlib.pyplot as plt
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +9,7 @@ import torchvision
 
 # Fully connected PC graph
 class FCPCGraph(nn.Module):
-    def __init__(self, N, S, T=10, activation_fn='relu'):
+    def __init__(self, N, S, T=10, activation_fn='hardtanh'):
         """Fully-connected Predictive coding graph (PC-graph) implementation.
 
         N -- total number of vertices (sensory + internal)
@@ -28,6 +28,8 @@ class FCPCGraph(nn.Module):
             self.f = nn.Sigmoid()
         elif activation_fn == 'tanh':
             self.f = nn.Tanh()
+        elif activation_fn == 'hardtanh':
+            self.f = nn.Hardtanh()
         else:
             raise Exception('Activation function not supported')
 
@@ -38,6 +40,8 @@ class FCPCGraph(nn.Module):
             return self.f(x) * (1 - self.f(x))
         elif self.activation_fn == 'tanh':
             return 1 - self.f(x)**2
+        elif self.activation_fn == 'hardtanh':
+            return (x > -1) * (x < 1).float()
         else:
             raise Exception('Activation function not supported')
 
@@ -52,15 +56,20 @@ class FCPCGraph(nn.Module):
             self.x[0, :self.S] = s
 
     def inference_step(self):
-        eps = self.x - self.f(self.x) @ self.theta
-        x_grad = eps - self.fprime(self.x) * (eps @ self.theta.T)
-        # set first S components to zero
-        x_grad[0, :self.S] = 0.
-        self.x.grad = x_grad
+        print('-------------------')
+        with torch.no_grad():
+            eps = self.x - self.f(self.x) @ self.theta
+            print(eps)
+            x_grad = eps - self.fprime(self.x) * (eps @ self.theta.T)
+            # set first S components to zero
+            x_grad[0, :self.S] = 0.
+            self.x.grad = x_grad
+
 
     def wu_step(self):
-        eps = self.x - self.f(self.x) @ self.theta
-        self.theta.grad = self.f(self.x).T @ eps
+        with torch.no_grad():
+            eps = self.x - self.f(self.x) @ self.theta
+            self.theta.grad = self.f(self.x).T @ eps
 
 
 def set_random_seed(seed):
@@ -88,8 +97,9 @@ def train_mnist():
     num_sensory_vertices = input_size + output_size
     num_vertices = 1500
 
-    inf_lr = 0.5
-    wu_lr = 0.00005
+    inf_lr = 1.0
+    wu_lr = 1e-4
+    wu_weight_decay = 1e-2
 
     device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device_name)
@@ -106,30 +116,42 @@ def train_mnist():
     model = FCPCGraph(N=num_vertices, S=num_sensory_vertices, T=pcg_inf_steps, activation_fn='relu').to(device)
     model.to(device)
 
+    print(f'Weight parameters: {sum(p.numel() for p in model.wu_parameters() if p.requires_grad)}')
+    print(f'Inference parameters: {sum(p.numel() for p in model.inf_parameters() if p.requires_grad)}')
+
     inf_optimizer = torch.optim.SGD(model.inf_parameters(), lr=inf_lr)
-    wu_optimizer = torch.optim.SGD(model.wu_parameters(), lr=wu_lr)
+    wu_optimizer = torch.optim.Adam(model.wu_parameters(), lr=wu_lr, weight_decay=wu_weight_decay)
 
-    print(type(model.parameters()))
-
-    print(f'Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+    num_plots = 2
+    fig, axes = plt.subplots(num_plots, 1, figsize=(8,6))
 
     for epoch in range(num_epochs):
+        if epoch == 1:
+            break
         print(f'Epoch {epoch}')
         for batch_idx, (X, y) in enumerate(loader_train):
+            if batch_idx == 2:
+                break
             X = X.view(batch_size, -1)
             Y = F.one_hot(y, num_classes=output_size).float()
             Z = torch.cat((X, Y), dim=1)
             if batch_idx % 500 == 0:
                 print(f'Example {batch_idx}')
             model.clamp_input(Z)
+
+            avg_inf_grads = []
             for t in range(pcg_inf_steps):
                 inf_optimizer.zero_grad()
                 model.inference_step()
+                avg_inf_grad = torch.mean(model.inf_parameters()[0].grad.detach())
+                avg_inf_grads.append(avg_inf_grad)
                 inf_optimizer.step()
+
+            axes[batch_idx].plot(avg_inf_grads)
+
             wu_optimizer.zero_grad()
             model.wu_step()
             wu_optimizer.step()
-
 
 
 if __name__ == '__main__':
